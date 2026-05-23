@@ -163,6 +163,13 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
 .loading-sub { font-size: 13px; color: var(--mid); }
 .spinner { width: 28px; height: 28px; border: 2.5px solid rgba(200,130,74,0.2); border-top-color: var(--caramel); border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+.queue-list { padding: 8px 20px 100px; display: flex; flex-direction: column; gap: 10px; }
+.queue-ticket { background: white; border-radius: 12px; border: 1.5px solid var(--border); padding: 12px 16px; display: flex; align-items: center; gap: 12px; }
+.queue-ticket-info { flex: 1; }
+.queue-ticket-drink { font-size: 14px; font-weight: 500; color: var(--espresso); }
+.queue-ticket-guest { font-size: 12px; color: var(--mid); margin-top: 2px; }
+.btn-serve { background: var(--espresso); color: var(--caramel); border: none; border-radius: 8px; padding: 6px 12px; font-size: 12px; font-family: 'DM Sans', sans-serif; font-weight: 500; cursor: pointer; white-space: nowrap; transition: opacity 0.15s; flex-shrink: 0; }
+.btn-serve:hover { opacity: 0.85; }
 </style>
 </head>
 <body>
@@ -222,6 +229,19 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
     <div class="empty-state" id="empty-state" style="grid-column:1/-1">
       <div class="icon">☕</div>
       <p>No open tabs yet.<br>Tap <strong>New Tab</strong> to add your first guest.</p>
+    </div>
+  </div>
+</div>
+
+<!-- VIEW: QUEUE -->
+<div class="view" id="view-queue">
+  <div class="section-header">
+    <div class="section-title">Order Queue</div>
+  </div>
+  <div class="queue-list" id="queue-list">
+    <div class="empty-state" id="queue-empty">
+      <div class="icon">✓</div>
+      <p>All caught up!<br>No pending orders right now.</p>
     </div>
   </div>
 </div>
@@ -342,6 +362,10 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9h10M7 13h6"/></svg>
     Tabs
   </button>
+  <button class="nav-btn" onclick="switchView('queue')" id="nav-queue">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="9" cy="7" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="9" cy="17" r="1" fill="currentColor" stroke="none"/><path d="M13 7h6M13 12h6M13 17h6"/></svg>
+    Queue
+  </button>
   <button class="nav-btn" onclick="switchView('menu')" id="nav-menu">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2"/><rect x="9" y="3" width="6" height="4" rx="1"/><path d="M9 12h6M9 16h4"/></svg>
     Menu
@@ -367,6 +391,8 @@ let menu = JSON.parse(localStorage.getItem('bcc_menu') || 'null') || [
 ];
 let activeCustomerId = null;
 let isSyncing = false;
+let dirtySync = localStorage.getItem('bcc_dirty') === '1';
+let retryTimer = null;
 
 function activeEvent() { return events.find(e => e.status === 'live') || null; }
 
@@ -384,10 +410,10 @@ function gsFetch(params) {
     script.src = url.toString();
 
     const timer = setTimeout(() => {
-      cleanup(); console.warn('Sheet request timed out'); resolve(null);
+      cleanup(); console.warn('Sheet request timed out'); resolve({ ok: false });
     }, 15000);
 
-    window[cbName] = (data) => { cleanup(); resolve(data); };
+    window[cbName] = (data) => { cleanup(); resolve({ ok: true, data }); };
 
     function cleanup() {
       clearTimeout(timer);
@@ -395,7 +421,7 @@ function gsFetch(params) {
       if (script.parentNode) script.parentNode.removeChild(script);
     }
 
-    script.onerror = () => { cleanup(); resolve(null); };
+    script.onerror = () => { cleanup(); resolve({ ok: false }); };
     document.head.appendChild(script);
   });
 }
@@ -414,47 +440,71 @@ async function save() {
 async function syncToSheets() {
   if (isSyncing) return;
   isSyncing = true;
+  dirtySync = true;
+  localStorage.setItem('bcc_dirty', '1');
   setSyncStatus('syncing');
+  let allOk = true;
   try {
-    await gsFetch({ action: 'saveMenu', data: menu });
-    for (const ev of events) {
-      await gsFetch({ action: 'saveEvent', data: { id: ev.id, name: ev.name, date: ev.date, status: ev.status } });
-      await gsFetch({ action: 'saveTabs', data: { eventId: ev.id, customers: ev.customers } });
+  const r0 = await gsFetch({ action: 'saveMenu', data: menu });
+  if (!r0.ok) allOk = false;
+
+  for (const ev of events) {
+    const r1 = await gsFetch({ action: 'saveEvent', data: { id: ev.id, name: ev.name, date: ev.date, status: ev.status } });
+    if (!r1.ok) { allOk = false; continue; }
+    // Send one customer at a time to stay well under URL length limits
+    for (const customer of ev.customers) {
+      const r2 = await gsFetch({ action: 'saveTabs', data: { eventId: ev.id, customers: [customer] } });
+      if (!r2.ok) allOk = false;
     }
-    setSyncStatus('ok');
-  } catch(e) {
-    setSyncStatus('error');
   }
-  isSyncing = false;
+
+  } catch(e) {
+    allOk = false;
+  } finally {
+    dirtySync = !allOk;
+    localStorage.setItem('bcc_dirty', dirtySync ? '1' : '0');
+    setSyncStatus(dirtySync ? 'error' : 'ok');
+    isSyncing = false;
+    if (dirtySync) scheduleRetry();
+  }
+}
+
+function scheduleRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => { retryTimer = null; syncToSheets(); }, 30000);
 }
 
 function setSyncStatus(state) {
   const el = document.getElementById('sync-indicator');
   if (!el) return;
   if (state === 'syncing') { el.textContent = '↑ Syncing'; el.style.color = 'var(--caramel)'; }
-  else if (state === 'ok') { el.textContent = '✓ Saved to Sheet'; el.style.color = '#6abf7b'; setTimeout(() => el.textContent = '', 2500); }
-  else { el.textContent = '⚠ Offline'; el.style.color = '#e8a87c'; setTimeout(() => el.textContent = '', 3000); }
+  else if (state === 'ok') { el.textContent = '✓ Synced'; el.style.color = '#6abf7b'; }
+  else { el.textContent = '⚠ Sync failed'; el.style.color = '#e8a87c'; }
 }
 
 // ── LOAD FROM SHEETS ON STARTUP ──
 async function loadFromSheets() {
   setLoadingMsg('Loading your menu...');
   try {
-    const remoteMenu = await gsFetch({ action: 'getMenu' });
-    if (remoteMenu && Array.isArray(remoteMenu) && remoteMenu.length > 0) {
-      menu = remoteMenu.map(r => ({ category: r.category, name: r.name, price: Number(r.price) }));
+    const r0 = await gsFetch({ action: 'getMenu' });
+    if (r0.ok && Array.isArray(r0.data) && r0.data.length > 0) {
+      menu = r0.data.map(r => ({ category: r.category, name: r.name, price: Number(r.price) }));
     }
 
     setLoadingMsg('Loading events...');
-    const remoteEvents = await gsFetch({ action: 'getEvents' });
-    if (remoteEvents && Array.isArray(remoteEvents) && remoteEvents.length > 0) {
-      const fullEvents = [];
-      for (const ev of remoteEvents) {
-        setLoadingMsg('Loading tabs for ' + ev.name + '...');
-        const tabs = await gsFetch({ action: 'getTabs', eventId: ev.id });
-        fullEvents.push({ id: ev.id, name: ev.name, date: ev.date, status: ev.status, customers: tabs || [] });
+    const r1 = await gsFetch({ action: 'getEvents' });
+    if (r1.ok && Array.isArray(r1.data) && r1.data.length > 0) {
+      // If we have unsynced local changes, keep local data and push it to sheets instead
+      if (!dirtySync) {
+        const fullEvents = [];
+        for (const ev of r1.data) {
+          setLoadingMsg('Loading tabs for ' + ev.name + '...');
+          const r2 = await gsFetch({ action: 'getTabs', eventId: ev.id });
+          const existingEv = events.find(e => e.id === ev.id);
+          fullEvents.push({ id: ev.id, name: ev.name, date: ev.date, status: ev.status, customers: r2.ok && Array.isArray(r2.data) ? r2.data : (existingEv ? existingEv.customers : []) });
+        }
+        events = fullEvents;
       }
-      events = fullEvents;
     }
 
     saveLocal();
@@ -471,6 +521,8 @@ async function loadFromSheets() {
   updateBanner();
   renderEvents();
   if (activeEvent()) document.getElementById('nav-tabs').style.color = 'var(--caramel)';
+  // Flush any writes that failed in a previous session
+  if (dirtySync) syncToSheets();
 }
 
 function setLoadingMsg(msg) {
@@ -486,6 +538,7 @@ function switchView(v) {
   if (nb) nb.classList.add('active');
   if (v === 'events') renderEvents();
   if (v === 'tabs') renderCustomers();
+  if (v === 'queue') renderQueue();
   if (v === 'menu') renderMenuEditor();
   updateBanner();
 }
@@ -584,7 +637,10 @@ function confirmEndEvent(markOpenAsPaid) {
 }
 
 // ── CUSTOMERS ──
-function customerTotal(c) { return c.orders.reduce((s, o) => s + o.price * o.qty, 0); }
+function customerTotal(c) {
+  if (c.orders.length === 0) return 0;
+  return c.orders.reduce((s, o) => s + o.price * o.qty, 0) - c.orders[0].price;
+}
 
 function renderCustomers() {
   const ev = activeEvent();
@@ -666,9 +722,8 @@ function renderMenuForOrder() {
 }
 function addDrink(name, price) {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
-  const ex = c.orders.find(o => o.name === name);
-  if (ex) ex.qty++; else c.orders.push({ name, price, qty: 1 });
-  save(); updatePanelTotal(); showToast(name + ' added');
+  c.orders.push({ name, price, qty: 1, served: 0 });
+  save(); updatePanelTotal(); renderTabOrderList(); showToast(name + ' added');
 }
 function renderTabOrderList() {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
@@ -676,32 +731,67 @@ function renderTabOrderList() {
   const empty = document.getElementById('tab-empty');
   if (!c || c.orders.length === 0) { list.innerHTML = ''; if (empty) empty.style.display = ''; return; }
   if (empty) empty.style.display = 'none';
-  list.innerHTML = c.orders.map((o, i) => `
+  // Group by drink name, preserving order of first appearance
+  const groupMap = {};
+  const groups = [];
+  c.orders.forEach((o, idx) => {
+    if (!groupMap[o.name]) { groupMap[o.name] = groups.length; groups.push({ name: o.name, price: o.price, indices: [] }); }
+    groups[groupMap[o.name]].indices.push(idx);
+  });
+
+  list.innerHTML = groups.map((g, gi) => {
+    const qty = g.indices.length;
+    const isCompl = gi === 0;
+    const chargedQty = isCompl ? qty - 1 : qty;
+    const priceCell = isCompl && qty === 1
+      ? `<span style="color:#3a7d44;font-size:12px;font-weight:500;">Free</span>`
+      : `₹${chargedQty * g.price}`;
+    // Prefer removing an unserved entry so we don't discard a drink already made
+    const unservedIdx = [...g.indices].reverse().find(i => !(c.orders[i].served || 0));
+    const removeIdx = unservedIdx !== undefined ? unservedIdx : g.indices[g.indices.length - 1];
+    return `
     <div class="order-item">
-      <div class="order-item-name">${o.name}</div>
+      <div class="order-item-name">${g.name}${isCompl ? ` <span style="font-size:10px;background:#e8f5e0;color:#3a7d44;padding:1px 6px;border-radius:10px;font-weight:500;">Compl.</span>` : ''}</div>
       <div class="order-item-qty">
-        <button class="qty-btn" onclick="changeQty(${i},-1)">−</button>
-        <div class="qty-num">${o.qty}</div>
-        <button class="qty-btn" onclick="changeQty(${i},1)">+</button>
+        <button class="qty-btn" onclick="changeQty(${removeIdx},-1)">−</button>
+        <div class="qty-num">${qty}</div>
+        <button class="qty-btn" onclick="addDrink('${g.name.replace(/'/g,"\\'")}',${g.price})">+</button>
       </div>
-      <div class="order-item-price">₹${o.price * o.qty}</div>
-    </div>`).join('');
+      <div class="order-item-price">${priceCell}</div>
+    </div>`;
+  }).join('');
 }
 function changeQty(idx, delta) {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
   c.orders[idx].qty += delta;
   if (c.orders[idx].qty <= 0) c.orders.splice(idx, 1);
+  else c.orders[idx].served = Math.min(c.orders[idx].served || 0, c.orders[idx].qty);
   save(); updatePanelTotal(); renderTabOrderList();
 }
 
 // ── CHECKOUT ──
 function openCheckout() {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
+  if (!c || c.orders.length === 0) { showToast('No drinks on this tab yet'); return; }
   document.getElementById('checkout-name').textContent = c.name;
   document.getElementById('checkout-total').textContent = '₹' + customerTotal(c);
-  document.getElementById('checkout-items').innerHTML = c.orders.map(o =>
-    `<div class="modal-item"><div>${o.name} × ${o.qty}</div><div class="modal-item-right">₹${o.price * o.qty}</div></div>`
-  ).join('');
+  const coGroupMap = {};
+  const coGroups = [];
+  c.orders.forEach(o => {
+    if (!coGroupMap[o.name]) { coGroupMap[o.name] = coGroups.length; coGroups.push({ name: o.name, price: o.price, count: 0 }); }
+    coGroups[coGroupMap[o.name]].count++;
+  });
+  document.getElementById('checkout-items').innerHTML = coGroups.map((g, gi) => {
+    const isCompl = gi === 0;
+    if (isCompl) {
+      const paid = g.count - 1;
+      const label = paid > 0 ? `1 compl. + ${paid} paid` : 'Complimentary';
+      const amount = paid > 0 ? `₹${g.price * paid}` : 'Free';
+      return `<div class="modal-item"><div>${g.name} <span style="font-size:11px;color:#3a7d44;">(${label})</span></div><div class="modal-item-right">${amount}</div></div>`;
+    }
+    const suffix = g.count > 1 ? ` × ${g.count}` : '';
+    return `<div class="modal-item"><div>${g.name}${suffix}</div><div class="modal-item-right">₹${g.price * g.count}</div></div>`;
+  }).join('');
   document.getElementById('checkout-modal').classList.add('open');
 }
 function closeCheckoutModal() { document.getElementById('checkout-modal').classList.remove('open'); }
@@ -747,6 +837,49 @@ function deleteMenuItem(idx) {
   save(); renderMenuEditor(); showToast(item.name + ' removed');
 }
 
+// ── QUEUE ──
+function renderQueue() {
+  const ev = activeEvent();
+  const list = document.getElementById('queue-list');
+  const empty = document.getElementById('queue-empty');
+  if (!list) return;
+  list.querySelectorAll('.queue-ticket').forEach(el => el.remove());
+
+  const tickets = [];
+  if (ev) {
+    ev.customers.forEach(c => {
+      if (c.closed) return;
+      c.orders.forEach((o, idx) => {
+        const pending = o.qty - (o.served || 0);
+        if (pending > 0) tickets.push({ name: c.name, id: c.id, o, idx, pending });
+      });
+    });
+  }
+
+  if (tickets.length === 0) { empty.style.display = ''; return; }
+  empty.style.display = 'none';
+
+  const html = tickets.map(({ name, id, o, idx }) => `
+    <div class="queue-ticket">
+      <div class="queue-ticket-info">
+        <div class="queue-ticket-drink">${o.name}</div>
+        <div class="queue-ticket-guest">${name}</div>
+      </div>
+      <button class="btn-serve" onclick="serveDrink('${id}',${idx})">Serve ✓</button>
+    </div>`).join('');
+
+  empty.insertAdjacentHTML('afterend', html);
+}
+
+function serveDrink(customerId, orderIdx) {
+  const c = activeEvent().customers.find(x => x.id === customerId);
+  if (!c) return;
+  const o = c.orders[orderIdx];
+  if (!o) return;
+  o.served = Math.min((o.served || 0) + 1, o.qty);
+  save(); renderQueue(); showToast(o.name + ' served ✓');
+}
+
 // ── ANALYTICS ──
 function openAnalytics(eventId) {
   const ev = events.find(e => e.id === eventId);
@@ -776,7 +909,9 @@ function openAnalytics(eventId) {
   const guestsSorted = [...guests].sort((a, b) => customerTotal(b) - customerTotal(a));
   const guestsHTML = guestsSorted.map(c => {
     const t = customerTotal(c);
-    const drinks = c.orders.map(o => `${o.name}×${o.qty}`).join(', ') || 'No orders';
+    const drinks = c.orders.length > 0
+      ? c.orders.map((o, i) => i === 0 ? `${o.name} (compl.)` : o.name).join(', ')
+      : 'No orders';
     const badge = c.closed
       ? '<span style="font-size:10px;background:#e8f5e0;color:#3a7d44;padding:2px 7px;border-radius:10px;margin-left:8px;">Paid</span>'
       : '<span style="font-size:10px;background:#fff3e0;color:#b35c00;padding:2px 7px;border-radius:10px;margin-left:8px;">Unpaid</span>';
