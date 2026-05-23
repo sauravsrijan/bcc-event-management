@@ -649,7 +649,8 @@ function renderCustomers() {
   grid.querySelectorAll('.customer-card').forEach(el => el.remove());
   if (!ev || ev.customers.length === 0) { empty.style.display = ''; return; }
   empty.style.display = 'none';
-  const all = [...ev.customers.filter(c => !c.closed), ...ev.customers.filter(c => c.closed)];
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  const all = [...ev.customers.filter(c => !c.closed).sort(byName), ...ev.customers.filter(c => c.closed).sort(byName)];
   const cardsHTML = all.map(c => {
     const t = customerTotal(c);
     const count = c.orders.reduce((s, o) => s + o.qty, 0);
