@@ -266,7 +266,10 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
 <div class="view" id="view-analytics">
   <div class="section-header" style="padding-bottom:6px;">
     <div class="section-title" id="analytics-title">Event Report</div>
-    <button class="btn-ghost" onclick="switchView('events')" style="font-size:12px;">← Events</button>
+    <div style="display:flex;align-items:center;gap:12px;">
+      <button class="btn-ghost" onclick="deleteActiveAnalyticsEvent()" style="font-size:12px;color:#c0392b;">Delete</button>
+      <button class="btn-ghost" onclick="switchView('events')" style="font-size:12px;">← Events</button>
+    </div>
   </div>
   <div class="analytics-wrap" id="analytics-wrap"></div>
 </div>
@@ -276,7 +279,7 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
   <div class="panel-header">
     <button class="btn-back" onclick="closePanel()">←</button>
     <div class="panel-header-info">
-      <div class="panel-customer-name" id="panel-customer-name"></div>
+      <div class="panel-customer-name" id="panel-customer-name" style="display:flex;align-items:center;gap:8px;"><span id="panel-customer-name-text"></span><button onclick="renameCustomer()" style="background:none;border:none;cursor:pointer;color:var(--caramel);opacity:0.6;font-size:13px;padding:0;line-height:1;" title="Edit name">✎</button></div>
       <div class="panel-customer-meta">Open tab</div>
     </div>
     <div class="panel-total-badge" id="panel-total-badge">₹0</div>
@@ -448,7 +451,7 @@ async function syncToSheets() {
   const r0 = await gsFetch({ action: 'saveMenu', data: menu });
   if (!r0.ok) allOk = false;
 
-  for (const ev of events) {
+  for (const ev of events.filter(e => e.status === 'live')) {
     const r1 = await gsFetch({ action: 'saveEvent', data: { id: ev.id, name: ev.name, date: ev.date, status: ev.status } });
     if (!r1.ok) { allOk = false; continue; }
     // Send one customer at a time to stay well under URL length limits
@@ -461,6 +464,10 @@ async function syncToSheets() {
   } catch(e) {
     allOk = false;
   } finally {
+    if (allOk) {
+      events.forEach(ev => { if (ev.status !== 'live') ev.customers = []; });
+      saveLocal();
+    }
     dirtySync = !allOk;
     localStorage.setItem('bcc_dirty', dirtySync ? '1' : '0');
     setSyncStatus(dirtySync ? 'error' : 'ok');
@@ -558,7 +565,11 @@ function renderEvents() {
   list.querySelectorAll('.event-card').forEach(e => e.remove());
   if (events.length === 0) { empty.style.display = ''; return; }
   empty.style.display = 'none';
-  const sorted = [...events].reverse();
+  const sorted = [...events].sort((a, b) => {
+    if (a.status === 'live') return 1;
+    if (b.status === 'live') return -1;
+    return 0;
+  });
   sorted.forEach(ev => {
     const revenue = ev.customers.reduce((s, c) => s + customerTotal(c), 0);
     const totalDrinks = ev.customers.reduce((s, c) => s + c.orders.reduce((ss, o) => ss + o.qty, 0), 0);
@@ -578,6 +589,19 @@ function renderEvents() {
     card.onclick = isLive ? () => switchView('tabs') : () => openAnalytics(ev.id);
     empty.insertAdjacentElement('afterend', card);
   });
+}
+
+// ── DELETE EVENT ──
+let analyticsEventId = null;
+
+function deleteActiveAnalyticsEvent() {
+  if (!analyticsEventId) return;
+  const ev = events.find(x => x.id === analyticsEventId);
+  if (!ev || ev.status === 'live') return;
+  if (!confirm(`Delete "${ev.name}"? This removes it from local history only.`)) return;
+  events = events.filter(x => x.id !== analyticsEventId);
+  analyticsEventId = null;
+  save(); switchView('events'); showToast('Event deleted');
 }
 
 // ── NEW EVENT ──
@@ -680,11 +704,22 @@ function confirmAddCustomer() {
   save(); closeAddCustomer(); renderCustomers(); showToast(name + "'s tab opened");
 }
 
+// ── RENAME CUSTOMER ──
+function renameCustomer() {
+  const c = activeEvent().customers.find(x => x.id === activeCustomerId);
+  if (!c) return;
+  const name = prompt('Rename tab:', c.name);
+  if (!name || !name.trim() || name.trim() === c.name) return;
+  c.name = name.trim();
+  document.getElementById('panel-customer-name-text').textContent = c.name;
+  save(); showToast('Renamed to ' + c.name);
+}
+
 // ── ORDER PANEL ──
 function openCustomer(id) {
   activeCustomerId = id;
   const c = activeEvent().customers.find(x => x.id === id);
-  document.getElementById('panel-customer-name').textContent = c.name;
+  document.getElementById('panel-customer-name-text').textContent = c.name;
   updatePanelTotal(); renderMenuForOrder(); renderTabOrderList(); switchPanelTab('order');
   document.getElementById('order-panel').classList.add('open');
   document.getElementById('bottom-nav').style.display = 'none';
@@ -882,14 +917,21 @@ function serveDrink(customerId, orderIdx) {
 }
 
 // ── ANALYTICS ──
-function openAnalytics(eventId) {
+async function openAnalytics(eventId) {
   const ev = events.find(e => e.id === eventId);
   if (!ev) return;
+  analyticsEventId = eventId;
   document.getElementById('analytics-title').textContent = ev.name;
   document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active'));
   document.getElementById('view-analytics').classList.add('active');
-  const guests = ev.customers;
+  document.getElementById('analytics-wrap').innerHTML = '<div style="text-align:center;padding:40px;color:var(--mid);font-size:13px;">Loading...</div>';
+
+  let guests = ev.customers;
+  if (guests.length === 0) {
+    const r = await gsFetch({ action: 'getTabs', eventId: ev.id });
+    if (r.ok && Array.isArray(r.data)) guests = r.data;
+  }
   const revenue = guests.reduce((s, c) => s + customerTotal(c), 0);
   const totalDrinks = guests.reduce((s, c) => s + c.orders.reduce((ss, o) => ss + o.qty, 0), 0);
   const paidGuests = guests.filter(c => c.closed).length;
