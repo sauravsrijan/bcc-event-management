@@ -189,7 +189,6 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
   </div>
   <div class="header-right">
     <span id="sync-indicator"></span>
-    <button onclick="debugSync()" style="background:none;border:1px solid rgba(200,130,74,0.3);color:var(--caramel);border-radius:6px;padding:4px 8px;font-size:11px;cursor:pointer;font-family:DM Sans,sans-serif;">Test</button>
   </div>
 </div>
 
@@ -315,7 +314,7 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
       <div class="modal-total-label">Total to Collect</div>
       <div class="modal-total-amount" id="checkout-total"></div>
     </div>
-    <button class="btn-close-tab" onclick="closeTab()">Mark as Paid ✓</button>
+    <button class="btn-close-tab" id="btn-close-tab" onclick="closeTab()">Mark as Paid ✓</button>
     <button class="btn-cancel" onclick="closeCheckoutModal()">Keep Tab Open</button>
   </div>
 </div>
@@ -394,10 +393,24 @@ let menu = JSON.parse(localStorage.getItem('bcc_menu') || 'null') || [
 ];
 let activeCustomerId = null;
 let isSyncing = false;
+let pendingSync = false;
 let dirtySync = localStorage.getItem('bcc_dirty') === '1';
 let retryTimer = null;
+let syncTimer = null;
+let isLoading = true;
+// `${eventId}:${customerId}` -> JSON of the last customer payload the sheet acked
+let lastPushed = {};
 
 function activeEvent() { return events.find(e => e.status === 'live') || null; }
+
+// The live event's menu is mirrored onto the event itself, which makes it authoritative
+// over the sheet's single global menu slot. Without this, a reload mid-event could pull
+// back the previous event's drinks from a sheet that hasn't caught up yet.
+function setMenu(next) {
+  menu = next;
+  const ev = activeEvent();
+  if (ev) ev.menu = [...menu];
+}
 
 // ── GOOGLE SHEETS API (JSONP — avoids CORS) ──
 function gsFetch(params) {
@@ -434,43 +447,90 @@ function saveLocal() {
   localStorage.setItem('bcc_menu', JSON.stringify(menu));
 }
 
-// Save locally immediately (fast), sync to sheets in background (slow)
-async function save() {
+function markDirty() {
+  dirtySync = true;
+  localStorage.setItem('bcc_dirty', '1');
+}
+
+// Save locally immediately (fast), sync to sheets in background (slow).
+// Pass immediate=true for structural changes (new/end event, closing a tab) so they
+// don't sit in the debounce window. Marking dirty must happen synchronously here: if
+// the page dies mid-debounce, bcc_dirty is what stops the next load from clobbering
+// localStorage with stale sheet data.
+function save(immediate) {
   saveLocal();
-  syncToSheets();
+  markDirty();
+  if (immediate) {
+    clearTimeout(syncTimer); syncTimer = null;
+    return syncToSheets();
+  }
+  if (!syncTimer) syncTimer = setTimeout(() => { syncTimer = null; syncToSheets(); }, 1500);
+}
+
+function flushSync() {
+  if (syncTimer) { clearTimeout(syncTimer); syncTimer = null; syncToSheets(); }
 }
 
 async function syncToSheets() {
-  if (isSyncing) return;
+  if (isLoading || isSyncing) { pendingSync = true; return; }
   isSyncing = true;
-  dirtySync = true;
-  localStorage.setItem('bcc_dirty', '1');
   setSyncStatus('syncing');
   let allOk = true;
   try {
-  const r0 = await gsFetch({ action: 'saveMenu', data: menu });
-  if (!r0.ok) allOk = false;
+    let passes = 0;
+    do {
+      pendingSync = false;  // cleared at pass start, so a save mid-pass earns another pass
+      allOk = true;
+      // `events` can be reassigned by loadFromSheets while we await
+      const snapshot = events.slice();
 
-  for (const ev of events.filter(e => e.status === 'live')) {
-    const r1 = await gsFetch({ action: 'saveEvent', data: { id: ev.id, name: ev.name, date: ev.date, status: ev.status } });
-    if (!r1.ok) { allOk = false; continue; }
-    // Send one customer at a time to stay well under URL length limits
-    for (const customer of ev.customers) {
-      const r2 = await gsFetch({ action: 'saveTabs', data: { eventId: ev.id, customers: [customer] } });
-      if (!r2.ok) allOk = false;
-    }
-  }
+      // Never push an empty menu. A new event starts blank, and it's unknown whether the
+      // Apps Script treats [] as "clear the sheet" or as a malformed payload. The live
+      // event's own ev.menu is the local source of truth until real drinks are added.
+      if (menu.length > 0) {
+        const r0 = await gsFetch({ action: 'saveMenu', data: menu });
+        if (!r0.ok) allOk = false;
+      }
 
+      for (const ev of snapshot) {
+        if (!events.includes(ev)) continue;  // deleted or replaced mid-pass
+        let evOk = true;
+        // Payload shape deliberately unchanged from before — the Apps Script's tolerance for
+        // extra keys is unverified, and this write path now carries every status change.
+        const r1 = await gsFetch({ action: 'saveEvent', data: { id: ev.id, name: ev.name, date: ev.date, status: ev.status } });
+        if (!r1.ok) { allOk = false; continue; }  // never wipe on a failed status write
+
+        // needsTabPush carries a just-ended event's final tab state. Don't widen this to
+        // "has customers" — loadFromSheets repopulates done events, which would re-push
+        // every historical customer on the next drink tap.
+        if (ev.status === 'live' || ev.needsTabPush) {
+          // Send one customer at a time to stay well under URL length limits
+          for (const customer of ev.customers) {
+            const key = ev.id + ':' + customer.id;
+            const body = JSON.stringify(customer);
+            if (lastPushed[key] === body) continue;
+            const r2 = await gsFetch({ action: 'saveTabs', data: { eventId: ev.id, customers: [customer] } });
+            if (r2.ok) lastPushed[key] = body;
+            else { evOk = false; allOk = false; }
+          }
+        }
+
+        if (evOk && ev.status !== 'live') {
+          delete ev.needsTabPush;
+          ev.totals = eventTotals(ev);
+          ev.customers.forEach(c => delete lastPushed[ev.id + ':' + c.id]);
+          ev.customers = [];  // openAnalytics re-fetches these lazily via getTabs
+          saveLocal();
+        }
+      }
+      passes++;
+    } while (pendingSync && passes < 5);
   } catch(e) {
     allOk = false;
   } finally {
-    if (allOk) {
-      events.forEach(ev => { if (ev.status !== 'live') ev.customers = []; });
-      saveLocal();
-    }
-    dirtySync = !allOk;
+    dirtySync = !allOk || pendingSync;
     localStorage.setItem('bcc_dirty', dirtySync ? '1' : '0');
-    setSyncStatus(dirtySync ? 'error' : 'ok');
+    setSyncStatus(allOk ? 'ok' : 'error');
     isSyncing = false;
     if (dirtySync) scheduleRetry();
   }
@@ -503,16 +563,32 @@ async function loadFromSheets() {
     if (r1.ok && Array.isArray(r1.data) && r1.data.length > 0) {
       // If we have unsynced local changes, keep local data and push it to sheets instead
       if (!dirtySync) {
-        const fullEvents = [];
-        for (const ev of r1.data) {
+        const fromSheet = r1.data.filter(ev => ev.status !== 'deleted');
+        const merged = [];
+        for (const ev of fromSheet) {
           setLoadingMsg('Loading tabs for ' + ev.name + '...');
           const r2 = await gsFetch({ action: 'getTabs', eventId: ev.id });
           const existingEv = events.find(e => e.id === ev.id);
-          fullEvents.push({ id: ev.id, name: ev.name, date: ev.date, status: ev.status, customers: r2.ok && Array.isArray(r2.data) ? r2.data : (existingEv ? existingEv.customers : []) });
+          merged.push({
+            id: ev.id, name: ev.name, date: ev.date, status: ev.status,
+            endDate: ev.endDate || (existingEv && existingEv.endDate) || undefined,
+            customers: r2.ok && Array.isArray(r2.data) ? r2.data : (existingEv ? existingEv.customers : []),
+            // local-only, no sheet column to read these back from
+            totals: existingEv && existingEv.totals,
+            menu: existingEv && existingEv.menu,
+          });
         }
-        events = fullEvents;
+        // Keep events that only exist locally — they haven't reached the sheet yet
+        const sheetIds = new Set(fromSheet.map(ev => ev.id));
+        const localOnly = events.filter(e => !sheetIds.has(e.id) && e.status !== 'deleted');
+        events = [...merged, ...localOnly];
       }
     }
+
+    // The live event's own menu wins over the sheet's global slot, which may still hold the
+    // previous event's drinks if this event's menu hasn't been filled in yet.
+    const live = activeEvent();
+    if (live && Array.isArray(live.menu)) menu = live.menu;
 
     saveLocal();
   } catch(e) {
@@ -528,8 +604,9 @@ async function loadFromSheets() {
   updateBanner();
   renderEvents();
   if (activeEvent()) document.getElementById('nav-tabs').style.color = 'var(--caramel)';
-  // Flush any writes that failed in a previous session
-  if (dirtySync) syncToSheets();
+  isLoading = false;
+  // Flush any writes that failed in a previous session, or that were attempted while loading
+  if (dirtySync || pendingSync) syncToSheets();
 }
 
 function setLoadingMsg(msg) {
@@ -559,32 +636,42 @@ function updateBanner() {
 }
 
 // ── EVENTS VIEW ──
+// The sheet coerces the date column to an ISO timestamp; locally-created events carry an
+// already-formatted display string. Rendering in IST also undoes the UTC day shift.
+function formatEventDate(d) {
+  const s = String(d || '');
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(s)) return s;
+  const parsed = new Date(s);
+  if (isNaN(parsed.getTime())) return s;
+  return parsed.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
+}
+
 function renderEvents() {
   const list = document.getElementById('events-list');
   const empty = document.getElementById('events-empty');
   list.querySelectorAll('.event-card').forEach(e => e.remove());
-  if (events.length === 0) { empty.style.display = ''; return; }
+  const visible = events.filter(e => e.status !== 'deleted');
+  if (visible.length === 0) { empty.style.display = ''; return; }
   empty.style.display = 'none';
-  const sorted = [...events].sort((a, b) => {
+  const sorted = [...visible].sort((a, b) => {
     if (a.status === 'live') return 1;
     if (b.status === 'live') return -1;
     return 0;
   });
   sorted.forEach(ev => {
-    const revenue = ev.customers.reduce((s, c) => s + customerTotal(c), 0);
-    const totalDrinks = ev.customers.reduce((s, c) => s + c.orders.reduce((ss, o) => ss + o.qty, 0), 0);
+    const t = ev.customers.length > 0 ? eventTotals(ev) : (ev.totals || { revenue: 0, guests: 0, drinks: 0 });
     const isLive = ev.status === 'live';
     const card = document.createElement('div');
     card.className = 'event-card' + (isLive ? ' active-event' : '');
     card.innerHTML = `
       <div class="event-card-top">
-        <div><div class="event-name">${ev.name}</div><div class="event-date">${ev.date}</div></div>
+        <div><div class="event-name">${ev.name}</div><div class="event-date">${formatEventDate(ev.date)}</div></div>
         <div class="event-badge ${isLive ? 'live' : 'done'}">${isLive ? 'Live' : 'Done'}</div>
       </div>
       <div class="event-stats">
-        <div class="event-stat"><strong>₹${revenue}</strong>Revenue</div>
-        <div class="event-stat"><strong>${ev.customers.length}</strong>Guests</div>
-        <div class="event-stat"><strong>${totalDrinks}</strong>Drinks</div>
+        <div class="event-stat"><strong>₹${t.revenue}</strong>Revenue</div>
+        <div class="event-stat"><strong>${t.guests}</strong>Guests</div>
+        <div class="event-stat"><strong>${t.drinks}</strong>Drinks</div>
       </div>`;
     card.onclick = isLive ? () => switchView('tabs') : () => openAnalytics(ev.id);
     empty.insertAdjacentElement('afterend', card);
@@ -598,10 +685,13 @@ function deleteActiveAnalyticsEvent() {
   if (!analyticsEventId) return;
   const ev = events.find(x => x.id === analyticsEventId);
   if (!ev || ev.status === 'live') return;
-  if (!confirm(`Delete "${ev.name}"? This removes it from local history only.`)) return;
-  events = events.filter(x => x.id !== analyticsEventId);
+  if (!confirm(`Delete "${ev.name}"? This hides it from your event history.`)) return;
+  // Soft-delete: 'deleted' rides the existing saveEvent status column, so it survives a
+  // reload without needing a deleteEvent action on the Apps Script side. The tombstone is
+  // dropped locally on the next load, since loadFromSheets filters deleted events out.
+  ev.status = 'deleted';
   analyticsEventId = null;
-  save(); switchView('events'); showToast('Event deleted');
+  save(true); switchView('events'); showToast('Event deleted');
 }
 
 // ── NEW EVENT ──
@@ -616,7 +706,10 @@ function confirmNewEvent() {
   if (!name) return;
   const date = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
   events.push({ id: Date.now().toString(), name, date, status: 'live', customers: [] });
-  save(); closeNewEventModal(); switchView('tabs'); showToast(name + ' started!');
+  // Every event runs a fresh lineup. The outgoing menu was snapshotted onto the previous
+  // event by confirmEndEvent, so clearing it here loses nothing.
+  setMenu([]);
+  save(true); closeNewEventModal(); switchView('menu'); showToast('Add ' + name + "'s drinks");
 }
 
 // ── END EVENT ──
@@ -655,15 +748,29 @@ function confirmEndEvent(markOpenAsPaid) {
   if (markOpenAsPaid) {
     ev.customers.forEach(c => { if (!c.closed) c.closed = true; });
   }
+  // Must be set before the status flip: it's what tells syncToSheets to push this event's
+  // final tab state even though it's no longer live.
+  ev.needsTabPush = true;
+  ev.menu = [...menu];
   ev.status = 'done';
   ev.endDate = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
-  save(); closeEndEventModal(); switchView('events'); showToast(ev.name + ' archived ✓');
+  save(true); closeEndEventModal(); switchView('events'); showToast(ev.name + ' archived ✓');
 }
 
 // ── CUSTOMERS ──
 function customerTotal(c) {
   if (c.orders.length === 0) return 0;
   return c.orders.reduce((s, o) => s + o.price * o.qty, 0) - c.orders[0].price;
+}
+
+// Cached before an archived event's customers are dropped, so event cards keep
+// showing real numbers instead of zeros until the next load refetches them.
+function eventTotals(ev) {
+  return {
+    revenue: ev.customers.reduce((s, c) => s + customerTotal(c), 0),
+    guests: ev.customers.length,
+    drinks: ev.customers.reduce((s, c) => s + c.orders.reduce((ss, o) => ss + o.qty, 0), 0),
+  };
 }
 
 function renderCustomers() {
@@ -701,7 +808,7 @@ function confirmAddCustomer() {
   const name = document.getElementById('new-customer-name').value.trim();
   if (!name) return;
   activeEvent().customers.push({ id: Date.now().toString(), name, orders: [], closed: false });
-  save(); closeAddCustomer(); renderCustomers(); showToast(name + "'s tab opened");
+  save(true); closeAddCustomer(); renderCustomers(); showToast(name + "'s tab opened");
 }
 
 // ── RENAME CUSTOMER ──
@@ -758,7 +865,7 @@ function renderMenuForOrder() {
 }
 function addDrink(name, price) {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
-  c.orders.push({ name, price, qty: 1, served: 0 });
+  c.orders.push({ name, price, qty: 1, served: 0, ts: Date.now() });
   save(); updatePanelTotal(); renderTabOrderList(); showToast(name + ' added');
 }
 function renderTabOrderList() {
@@ -808,7 +915,7 @@ function changeQty(idx, delta) {
 // ── CHECKOUT ──
 function openCheckout() {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
-  if (!c || c.orders.length === 0) { showToast('No drinks on this tab yet'); return; }
+  if (!c) return;
   document.getElementById('checkout-name').textContent = c.name;
   document.getElementById('checkout-total').textContent = '₹' + customerTotal(c);
   const coGroupMap = {};
@@ -817,7 +924,9 @@ function openCheckout() {
     if (!coGroupMap[o.name]) { coGroupMap[o.name] = coGroups.length; coGroups.push({ name: o.name, price: o.price, count: 0 }); }
     coGroups[coGroupMap[o.name]].count++;
   });
-  document.getElementById('checkout-items').innerHTML = coGroups.map((g, gi) => {
+  document.getElementById('checkout-items').innerHTML = coGroups.length === 0
+    ? `<div class="modal-item"><div style="color:var(--mid);">No drinks ordered</div><div class="modal-item-right">₹0</div></div>`
+    : coGroups.map((g, gi) => {
     const isCompl = gi === 0;
     if (isCompl) {
       const paid = g.count - 1;
@@ -828,6 +937,7 @@ function openCheckout() {
     const suffix = g.count > 1 ? ` × ${g.count}` : '';
     return `<div class="modal-item"><div>${g.name}${suffix}</div><div class="modal-item-right">₹${g.price * g.count}</div></div>`;
   }).join('');
+  document.getElementById('btn-close-tab').textContent = coGroups.length === 0 ? 'Close Empty Tab ✓' : 'Mark as Paid ✓';
   document.getElementById('checkout-modal').classList.add('open');
 }
 function closeCheckoutModal() { document.getElementById('checkout-modal').classList.remove('open'); }
@@ -836,8 +946,8 @@ function closeTab() {
   const c = ev.customers.find(x => x.id === activeCustomerId);
   const total = customerTotal(c);
   c.closed = true;
-  save(); closeCheckoutModal(); closePanel();
-  showToast(c.name + ' paid ₹' + total + ' ✓');
+  save(true); closeCheckoutModal(); closePanel();
+  showToast(c.orders.length === 0 ? c.name + "'s tab closed" : c.name + ' paid ₹' + total + ' ✓');
 }
 
 // ── MENU EDITOR ──
@@ -862,14 +972,15 @@ function addMenuItem() {
   const name = document.getElementById('new-item-name').value.trim();
   const price = parseInt(document.getElementById('new-item-price').value);
   if (!name || !price || !cat) { showToast('Fill in category, name & price'); return; }
-  menu.push({ category: cat, name, price });
+  setMenu([...menu, { category: cat, name, price }]);
   save();
   document.getElementById('new-item-name').value = '';
   document.getElementById('new-item-price').value = '';
   renderMenuEditor(); showToast(name + ' added to menu');
 }
 function deleteMenuItem(idx) {
-  const item = menu[idx]; menu.splice(idx, 1);
+  const item = menu[idx];
+  setMenu(menu.filter((_, i) => i !== idx));
   save(); renderMenuEditor(); showToast(item.name + ' removed');
 }
 
@@ -894,6 +1005,11 @@ function renderQueue() {
 
   if (tickets.length === 0) { empty.style.display = ''; return; }
   empty.style.display = 'none';
+
+  // True FIFO by when the drink was ordered. Without this the list is grouped by when each
+  // guest's tab was opened, so the first guest's late orders jump the whole queue.
+  // Orders predating the ts field sort first, which is the right guess for older tickets.
+  tickets.sort((a, b) => (a.o.ts || 0) - (b.o.ts || 0));
 
   const html = tickets.map(({ name, id, o, idx }) => `
     <div class="queue-ticket">
@@ -964,7 +1080,7 @@ async function openAnalytics(eventId) {
     </div>`;
   }).join('');
   document.getElementById('analytics-wrap').innerHTML = `
-    <div style="font-size:12px;color:var(--mid);margin-bottom:16px;">${ev.date}</div>
+    <div style="font-size:12px;color:var(--mid);margin-bottom:16px;">${formatEventDate(ev.date)}</div>
     <div class="stat-grid">
       <div class="stat-card"><div class="stat-label">Revenue</div><div class="stat-value">₹${revenue}</div></div>
       <div class="stat-card"><div class="stat-label">Guests</div><div class="stat-value">${guests.length}</div><div class="stat-sub">${paidGuests} paid</div></div>
@@ -998,45 +1114,17 @@ function showToast(msg) {
   setTimeout(() => t.classList.remove('show'), 2200);
 }
 
-// ── DEBUG ──
-function debugSync() {
-  const log = (msg) => {
-    console.log('[BCC]', msg);
-    showToast(msg);
-  };
-  log('Testing connection...');
-  const cbName = 'bcc_debug_' + Date.now();
-  const url = new URL(API);
-  url.searchParams.set('action', 'getEvents');
-  url.searchParams.set('callback', cbName);
-  const script = document.createElement('script');
-  script.src = url.toString();
-  window[cbName] = (data) => {
-    delete window[cbName];
-    script.remove();
-    log('✓ Connected! Events: ' + JSON.stringify(data));
-  };
-  script.onerror = () => {
-    delete window[cbName];
-    script.remove();
-    log('✗ Script load failed');
-  };
-  setTimeout(() => {
-    if (window[cbName]) {
-      delete window[cbName];
-      script.remove();
-      log('✗ Timed out — no response');
-    }
-  }, 10000);
-  document.head.appendChild(script);
-}
-
 // ── INIT ──
 // Show local data immediately while we fetch fresh data
 updateBanner();
 renderEvents();
 // Then load fresh from Google Sheets
 loadFromSheets();
+
+// Don't let a debounced write sit unsent when the operator backgrounds the app.
+// iOS Safari doesn't fire beforeunload, so pagehide/visibilitychange are the hooks.
+window.addEventListener('pagehide', flushSync);
+document.addEventListener('visibilitychange', () => { if (document.hidden) flushSync(); });
 </script>
 </body>
 </html>
