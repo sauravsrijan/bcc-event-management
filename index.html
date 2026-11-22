@@ -77,6 +77,8 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
 .menu-item-price { font-size: 14px; color: var(--roast); font-weight: 500; }
 .menu-item-add { width: 28px; height: 28px; background: var(--espresso); color: var(--caramel); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 300; flex-shrink: 0; transition: background 0.15s; }
 .menu-item:hover .menu-item-add { background: var(--caramel); color: white; }
+.menu-item-note { width: 28px; height: 28px; background: none; border: 1.5px solid var(--border); color: var(--mid); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 13px; flex-shrink: 0; cursor: pointer; padding: 0; transition: border-color 0.15s, color 0.15s; }
+.menu-item-note:hover { border-color: var(--caramel); color: var(--roast); }
 .order-list { padding: 0 20px; display: flex; flex-direction: column; gap: 8px; }
 .order-item { background: white; border: 1.5px solid var(--border); border-radius: 12px; padding: 12px 14px; display: flex; align-items: center; gap: 10px; }
 .order-item-name { flex: 1; font-size: 14px; }
@@ -170,6 +172,12 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
 .queue-ticket-guest { font-size: 12px; color: var(--mid); margin-top: 2px; }
 .btn-serve { background: var(--espresso); color: var(--caramel); border: none; border-radius: 8px; padding: 6px 12px; font-size: 12px; font-family: 'DM Sans', sans-serif; font-weight: 500; cursor: pointer; white-space: nowrap; transition: opacity 0.15s; flex-shrink: 0; }
 .btn-serve:hover { opacity: 0.85; }
+.btn-note { background: none; border: 1.5px solid var(--border); color: var(--mid); border-radius: 8px; padding: 5px 10px; font-size: 12px; font-family: 'DM Sans', sans-serif; cursor: pointer; white-space: nowrap; flex-shrink: 0; }
+.btn-note:hover { border-color: var(--caramel); color: var(--roast); }
+.order-note { font-size: 12px; color: #b35c00; background: #fff3e0; border-radius: 6px; padding: 4px 8px; margin-top: 6px; white-space: pre-wrap; word-break: break-word; }
+.order-note.small { margin-top: 4px; padding: 2px 6px; font-size: 11px; }
+.queue-ticket { flex-wrap: wrap; }
+.queue-ticket > .order-note { flex-basis: 100%; margin-top: -4px; }
 </style>
 </head>
 <body>
@@ -340,6 +348,19 @@ body { background: var(--cream); font-family: 'DM Sans', sans-serif; color: var(
     <div class="btn-row">
       <button class="btn-secondary" onclick="closeNewEventModal()">Cancel</button>
       <button class="btn-confirm" onclick="confirmNewEvent()">Start Event →</button>
+    </div>
+  </div>
+</div>
+
+<!-- ORDER NOTE MODAL -->
+<div class="add-modal-overlay" id="note-modal">
+  <div class="add-modal">
+    <div class="add-modal-title" id="note-modal-title">Order Note</div>
+    <div class="add-modal-sub" id="note-modal-sub"></div>
+    <textarea class="input-field" id="note-input" rows="3" maxlength="200" placeholder="e.g. oat milk, extra hot, less sugar" style="resize:none;"></textarea>
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="closeNoteModal()">Cancel</button>
+      <button class="btn-confirm" id="note-confirm" onclick="saveNote()">Save Note</button>
     </div>
   </div>
 </div>
@@ -572,7 +593,9 @@ async function loadFromSheets() {
           merged.push({
             id: ev.id, name: ev.name, date: ev.date, status: ev.status,
             endDate: ev.endDate || (existingEv && existingEv.endDate) || undefined,
-            customers: r2.ok && Array.isArray(r2.data) ? r2.data : (existingEv ? existingEv.customers : []),
+            customers: r2.ok && Array.isArray(r2.data)
+              ? keepLocalOrderFields(r2.data, existingEv)
+              : (existingEv ? existingEv.customers : []),
             // local-only, no sheet column to read these back from
             totals: existingEv && existingEv.totals,
             menu: existingEv && existingEv.menu,
@@ -607,6 +630,24 @@ async function loadFromSheets() {
   isLoading = false;
   // Flush any writes that failed in a previous session, or that were attempted while loading
   if (dirtySync || pendingSync) syncToSheets();
+}
+
+// The Apps Script only stores name/price/qty/served per order, so `note` and `ts` come back
+// stripped. Carry them over from this device's copy so a reload doesn't erase guest notes
+// or scramble queue order. Matched by customer id + order position, guarded by drink name.
+function keepLocalOrderFields(sheetCustomers, existingEv) {
+  if (!existingEv) return sheetCustomers;
+  return sheetCustomers.map(sc => {
+    const lc = existingEv.customers.find(c => c.id === sc.id);
+    if (!lc || !Array.isArray(sc.orders)) return sc;
+    sc.orders.forEach((o, i) => {
+      const lo = lc.orders[i];
+      if (!lo || lo.name !== o.name) return;
+      if (o.note === undefined && lo.note) o.note = lo.note;
+      if (o.ts === undefined && lo.ts) o.ts = lo.ts;
+    });
+    return sc;
+  });
 }
 
 function setLoadingMsg(msg) {
@@ -858,15 +899,18 @@ function renderMenuForOrder() {
       ${items.map(item => `<div class="menu-item" onclick="addDrink('${item.name.replace(/'/g,"\\'")}',${item.price})">
         <div class="menu-item-name">${item.name}</div>
         <div class="menu-item-price">₹${item.price}</div>
+        <button class="menu-item-note" title="Add with a note" onclick="event.stopPropagation(); openNoteForNewDrink('${item.name.replace(/'/g,"\\'")}',${item.price})">✎</button>
         <div class="menu-item-add">+</div>
       </div>`).join('')}
     </div></div>`;
   }).join('') || '<div style="padding:40px;text-align:center;color:var(--mid);font-size:14px;">No menu items. Add drinks in Menu tab.</div>';
 }
-function addDrink(name, price) {
+function addDrink(name, price, note) {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
-  c.orders.push({ name, price, qty: 1, served: 0, ts: Date.now() });
-  save(); updatePanelTotal(); renderTabOrderList(); showToast(name + ' added');
+  const order = { name, price, qty: 1, served: 0, ts: Date.now() };
+  if (note) order.note = note;
+  c.orders.push(order);
+  save(); updatePanelTotal(); renderTabOrderList(); showToast(name + ' added' + (note ? ' with note' : ''));
 }
 function renderTabOrderList() {
   const c = activeEvent().customers.find(x => x.id === activeCustomerId);
@@ -892,9 +936,10 @@ function renderTabOrderList() {
     // Prefer removing an unserved entry so we don't discard a drink already made
     const unservedIdx = [...g.indices].reverse().find(i => !(c.orders[i].served || 0));
     const removeIdx = unservedIdx !== undefined ? unservedIdx : g.indices[g.indices.length - 1];
+    const notes = g.indices.map(i => c.orders[i].note).filter(Boolean);
     return `
     <div class="order-item">
-      <div class="order-item-name">${g.name}${isCompl ? ` <span style="font-size:10px;background:#e8f5e0;color:#3a7d44;padding:1px 6px;border-radius:10px;font-weight:500;">Compl.</span>` : ''}</div>
+      <div class="order-item-name">${g.name}${isCompl ? ` <span style="font-size:10px;background:#e8f5e0;color:#3a7d44;padding:1px 6px;border-radius:10px;font-weight:500;">Compl.</span>` : ''}${notes.map(n => `<div class="order-note small">📝 ${escapeHtml(n)}</div>`).join('')}</div>
       <div class="order-item-qty">
         <button class="qty-btn" onclick="changeQty(${removeIdx},-1)">−</button>
         <div class="qty-num">${qty}</div>
@@ -1017,7 +1062,9 @@ function renderQueue() {
         <div class="queue-ticket-drink">${o.name}</div>
         <div class="queue-ticket-guest">${name}</div>
       </div>
+      <button class="btn-note" onclick="openNoteModal('${id}',${idx})">${o.note ? 'Edit note' : '+ Note'}</button>
       <button class="btn-serve" onclick="serveDrink('${id}',${idx})">Serve ✓</button>
+      ${o.note ? `<div class="order-note">📝 ${escapeHtml(o.note)}</div>` : ''}
     </div>`).join('');
 
   empty.insertAdjacentHTML('afterend', html);
@@ -1030,6 +1077,63 @@ function serveDrink(customerId, orderIdx) {
   if (!o) return;
   o.served = Math.min((o.served || 0) + 1, o.qty);
   save(); renderQueue(); showToast(o.name + ' served ✓');
+}
+
+// ── ORDER NOTES ──
+// A note lives on a single order entry (each tap of a drink is its own entry), so two
+// lattes for the same guest can carry different requests.
+let noteTarget = null;
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+function showNoteModal(title, sub, confirmLabel, value) {
+  document.getElementById('note-modal-title').textContent = title;
+  document.getElementById('note-modal-sub').textContent = sub;
+  document.getElementById('note-confirm').textContent = confirmLabel;
+  const input = document.getElementById('note-input');
+  input.value = value;
+  document.getElementById('note-modal').classList.add('open');
+  setTimeout(() => input.focus(), 100);
+}
+// From the queue: edit the note on a drink that's already ordered
+function openNoteModal(customerId, orderIdx) {
+  const c = activeEvent() && activeEvent().customers.find(x => x.id === customerId);
+  const o = c && c.orders[orderIdx];
+  if (!o) return;
+  noteTarget = { mode: 'edit', customerId, orderIdx, name: o.name };
+  showNoteModal('Order Note', o.name + ' for ' + c.name, 'Save Note', o.note || '');
+}
+// From Add Drinks: the drink is only added once the note is confirmed, so Cancel adds nothing
+function openNoteForNewDrink(name, price) {
+  const c = activeEvent() && activeEvent().customers.find(x => x.id === activeCustomerId);
+  if (!c) return;
+  noteTarget = { mode: 'add', customerId: c.id, name, price };
+  showNoteModal('Add with Note', name + ' for ' + c.name, 'Add with note', '');
+}
+function closeNoteModal() {
+  document.getElementById('note-modal').classList.remove('open');
+  noteTarget = null;
+}
+function saveNote() {
+  if (!noteTarget) return;
+  if (noteTarget.mode === 'add') {
+    const { customerId, name, price } = noteTarget;
+    const note = document.getElementById('note-input').value.trim();
+    closeNoteModal();
+    if (activeCustomerId !== customerId) return;  // panel was closed underneath us
+    addDrink(name, price, note);
+    return;
+  }
+  const c = activeEvent() && activeEvent().customers.find(x => x.id === noteTarget.customerId);
+  const o = c && c.orders[noteTarget.orderIdx];
+  // Guard against the order list shifting while the modal was open (e.g. a removed drink)
+  if (!o || o.name !== noteTarget.name) { closeNoteModal(); showToast('Order changed, try again'); return; }
+  const note = document.getElementById('note-input').value.trim();
+  if (note) o.note = note; else delete o.note;
+  closeNoteModal();
+  save(); renderQueue();
+  if (activeCustomerId === c.id) renderTabOrderList();
+  showToast(note ? 'Note saved' : 'Note removed');
 }
 
 // ── ANALYTICS ──
